@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MBO Event Inspector</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div>
+            <h1>MBO Events</h1>
+            <p>ES futures orderbook inspection</p>
+          </div>
+          <div class="brand-actions">
+            <button id="theme-toggle" class="icon-button" title="Toggle dark theme" aria-label="Toggle dark theme">◐</button>
+            <button id="refresh" class="icon-button" title="Refresh orderbooks" aria-label="Refresh orderbooks">↻</button>
+          </div>
+        </div>
+
+        <label class="search">
+          <span>Orderbook</span>
+          <input id="filter" type="search" placeholder="Filter symbol or id" autocomplete="off" />
+        </label>
+
+        <div id="summary" class="summary">Loading orderbooks...</div>
+        <div id="orderbooks" class="orderbooks" aria-label="Orderbooks"></div>
+      </aside>
+
+      <section class="content">
+        <nav class="view-tabs" aria-label="Dashboard views">
+          <button class="active" data-view="events">Event Edges</button>
+          <button data-view="replay">Book Replay</button>
+          <button data-view="chart">Trade Candles</button>
+        </nav>
+
+        <header class="toolbar">
+          <div>
+            <p class="eyebrow">Selected Orderbook</p>
+            <h2 id="selected-title">Loading...</h2>
+          </div>
+          <div class="controls">
+            <label>
+              Rows
+              <input id="limit" type="number" min="1" max="1000" step="50" value="200" />
+            </label>
+            <button id="load-events">Load</button>
+          </div>
+        </header>
+
+        <section class="stats" id="stats"></section>
+
+        <section class="tables view active" id="events-view">
+          <article class="panel">
+            <div class="panel-header">
+              <h3>First Events</h3>
+              <span id="first-count"></span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead id="first-head"></thead>
+                <tbody id="first-body"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-header">
+              <h3>Last Events</h3>
+              <span id="last-count"></span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead id="last-head"></thead>
+                <tbody id="last-body"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
+        <section class="view" id="replay-view">
+          <section class="replay-grid">
+            <article class="panel replay-panel">
+              <div class="panel-header">
+                <h3>Replay Controls</h3>
+                <span id="replay-position">0 / 0</span>
+              </div>
+              <div class="replay-controls">
+                <label>
+                  Session
+                  <select id="replay-date" disabled>
+                    <option value="">Loading</option>
+                  </select>
+                </label>
+                <label>
+                  Start Row
+                  <input id="replay-offset" type="number" min="0" step="1000" value="0" />
+                </label>
+                <label>
+                  Chunk
+                  <input id="replay-limit" type="number" min="1" max="10000" step="100" value="1000" />
+                </label>
+                <button id="replay-load" disabled>Load</button>
+                <button id="replay-prev" title="Previous event" aria-label="Previous event">←</button>
+                <button id="replay-next" title="Next event" aria-label="Next event">→</button>
+              </div>
+              <div class="session-card" id="replay-session">Choose a session and load replay rows.</div>
+              <div class="event-card" id="current-event">Load a replay chunk to begin.</div>
+              <div class="effect-card" id="event-effect"></div>
+            </article>
+
+            <article class="panel book-panel">
+              <div class="panel-header">
+                <h3>Top Levels After Event</h3>
+                <span id="book-counts"></span>
+              </div>
+              <div class="book-levels">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Bid Count</th>
+                      <th>Bid Size</th>
+                      <th>Bid Price</th>
+                      <th>Ask Price</th>
+                      <th>Ask Size</th>
+                      <th>Ask Count</th>
+                    </tr>
+                  </thead>
+                  <tbody id="book-body"></tbody>
+                </table>
+              </div>
+            </article>
+          </section>
+        </section>
+
+        <section class="view" id="chart-view">
+          <section class="chart-grid">
+            <article class="panel chart-control-panel">
+              <div class="panel-header">
+                <h3>Candle Replay</h3>
+                <span id="chart-position">0 / 0</span>
+              </div>
+              <div class="chart-controls">
+                <label>
+                  Session
+                  <select id="chart-date" disabled>
+                    <option value="">Loading</option>
+                  </select>
+                </label>
+                <label>
+                  Start Row
+                  <input id="chart-offset" type="number" min="0" step="1000" value="0" />
+                </label>
+                <label>
+                  Chunk
+                  <input id="chart-limit" type="number" min="1" max="10000" step="1000" value="10000" />
+                </label>
+                <label>
+                  Candle
+                  <select id="chart-interval">
+                    <option value="1000">1s</option>
+                    <option value="5000">5s</option>
+                    <option value="60000" selected>1m</option>
+                    <option value="300000">5m</option>
+                  </select>
+                </label>
+                <button id="chart-load" disabled>Load</button>
+                <button id="chart-step" title="Next event" aria-label="Next event">→</button>
+                <button id="chart-trade" title="Next trade" aria-label="Next trade">T</button>
+                <button id="chart-play">Play</button>
+                <button id="chart-slower" title="Slower replay" aria-label="Slower replay">−</button>
+                <span class="speed-readout" id="chart-speed">1x</span>
+                <button id="chart-faster" title="Faster replay" aria-label="Faster replay">+</button>
+              </div>
+              <div class="session-card" id="chart-session">Choose a session and load events.</div>
+              <div class="event-card" id="chart-event">Load an event chunk to begin.</div>
+            </article>
+
+            <article class="panel chart-panel">
+              <div class="panel-header">
+                <h3>Trades As Candles</h3>
+                <span id="chart-summary">0 trades</span>
+              </div>
+              <div class="chart-wrap">
+                <canvas id="candle-chart"></canvas>
+              </div>
+            </article>
+          </section>
+        </section>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
