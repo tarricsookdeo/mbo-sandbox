@@ -7,13 +7,13 @@ This workspace contains Databento `GLBX.MDP3` market-by-order files for ES futur
 Install the Python dependencies:
 
 ```bash
-python -m pip install -r requirements.txt
+uv sync
 ```
 
 Convert the daily DBN files to partitioned Parquet:
 
 ```bash
-python scripts/convert_dbn_to_parquet.py
+uv run python scripts/convert_dbn_to_parquet.py
 ```
 
 The output is a Parquet dataset, not one giant Parquet file. Each raw daily DBN
@@ -73,7 +73,7 @@ ORDER BY 1, 2;
 Start the local dashboard:
 
 ```bash
-PYENV_VERSION=3.14.0 pipenv run python scripts/dashboard_server.py
+uv run python scripts/dashboard_server.py
 ```
 
 Then open:
@@ -109,11 +109,11 @@ trade if the current session starts with book-building messages.
 To inspect a different symbol:
 
 ```bash
-PYENV_VERSION=3.14.0 pipenv run python scripts/dashboard_server.py --symbol ESU6
+uv run python scripts/dashboard_server.py --symbol ESU6
 ```
 
 To show every symbol again:
 
 ```bash
-PYENV_VERSION=3.14.0 pipenv run python scripts/dashboard_server.py --symbol ''
+uv run python scripts/dashboard_server.py --symbol ''
 ```
