@@ -34,6 +34,7 @@
           <button class="active" data-view="events">Event Edges</button>
           <button data-view="replay">Book Replay</button>
           <button data-view="chart">Trade Candles</button>
+          <button data-view="strategy">Strategy Replay</button>
         </nav>
 
         <header class="toolbar">
@@ -131,6 +132,65 @@
                   <tbody id="book-body"></tbody>
                 </table>
               </div>
+            </article>
+          </section>
+        </section>
+
+        <section class="view" id="strategy-view">
+          <section class="strategy-grid">
+            <article class="panel strategy-control-panel">
+              <div class="panel-header">
+                <h3>Strategy Replay</h3>
+                <span id="strategy-position">0 / 0</span>
+              </div>
+              <div class="strategy-controls">
+                <label>
+                  Session
+                  <select id="strategy-date" disabled>
+                    <option value="">Loading</option>
+                  </select>
+                </label>
+                <label>
+                  Chunk
+                  <input id="strategy-limit" type="number" min="100" max="10000" step="500" value="5000" />
+                </label>
+                <button id="strategy-load" disabled>Load</button>
+                <button id="strategy-step" title="Next event">→</button>
+                <button id="strategy-next-bar" title="Next bar close">▶|</button>
+                <button id="strategy-next-signal" title="Next signal or fill">⚡</button>
+                <button id="strategy-play">Play</button>
+                <button id="strategy-slower" title="Slower" aria-label="Slower">−</button>
+                <span class="speed-readout" id="strategy-speed">1x</span>
+                <button id="strategy-faster" title="Faster" aria-label="Faster">+</button>
+              </div>
+              <div class="session-card" id="strategy-session">Choose a session and load events.</div>
+              <div class="event-card" id="strategy-event">Load a session to begin.</div>
+            </article>
+
+            <article class="panel chart-panel strategy-chart-panel">
+              <div class="panel-header">
+                <h3>5m Candles with Buff</h3>
+                <span id="strategy-summary">No data</span>
+              </div>
+              <div class="chart-wrap">
+                <canvas id="strategy-chart"></canvas>
+              </div>
+            </article>
+
+            <article class="panel strategy-side-panel">
+              <div class="panel-header">
+                <h3>Position</h3>
+                <span id="strategy-pnl-readout"></span>
+              </div>
+              <div id="strategy-position-panel" class="position-panel">No position.</div>
+            </article>
+
+            <article class="panel strategy-side-panel">
+              <div class="panel-header">
+                <h3>Signals &amp; Fills</h3>
+                <span id="strategy-trade-count"></span>
+              </div>
+              <div id="strategy-signals" class="signals-log">No events fired yet.</div>
             </article>
           </section>
         </section>

@@ -35,18 +35,41 @@ const state = {
     timer: null,
     speedIndex: 2,
   },
+  strategy: {
+    dates: [],
+    date: "",
+    session: null,           // { bars, timeline, trades, summary }
+    events: [],              // raw MBO events for the day
+    total: 0,
+    firstTsEvent: null,
+    lastTsEvent: null,
+    offset: 0,
+    index: -1,
+    lastEvent: null,
+    lastTradePrice: null,
+    timelineIndex: 0,        // pointer into session.timeline
+    appliedEvents: [],       // strategy events that have fired so far (for log)
+    position: null,          // { side, qty, entry, stop, target, breakeven }
+    realizedPnl: 0,
+    sessionLoading: false,
+    chunkLoading: false,
+    playing: false,
+    timer: null,
+    speedIndex: 2,
+  },
 };
 
 const F_LAST = 128;
 const BOOK_LEVEL_LIMIT = 100;
 const CHART_VISIBLE_CANDLES = 90;
 const CHART_SPEEDS = [
-  { label: "0.25x", delay: 240 },
-  { label: "0.5x", delay: 120 },
-  { label: "1x", delay: 60 },
-  { label: "2x", delay: 30 },
-  { label: "4x", delay: 12 },
-  { label: "8x", delay: 1 },
+  { label: "0.25x", delay: 240, batch: 1 },
+  { label: "0.5x", delay: 120, batch: 1 },
+  { label: "1x", delay: 60, batch: 1 },
+  { label: "2x", delay: 30, batch: 1 },
+  { label: "4x", delay: 12, batch: 1 },
+  { label: "8x", delay: 1, batch: 1 },
+  { label: "20x", delay: 1, batch: 3 },
 ];
 const DEFAULT_CHART_SPEED_INDEX = 2;
 const THEME_STORAGE_KEY = "mbo-dashboard-theme";
@@ -113,6 +136,25 @@ const el = {
   chartEvent: document.querySelector("#chart-event"),
   chartSummary: document.querySelector("#chart-summary"),
   candleChart: document.querySelector("#candle-chart"),
+  strategyDate: document.querySelector("#strategy-date"),
+  strategyLimit: document.querySelector("#strategy-limit"),
+  strategyLoad: document.querySelector("#strategy-load"),
+  strategyStep: document.querySelector("#strategy-step"),
+  strategyNextBar: document.querySelector("#strategy-next-bar"),
+  strategyNextSignal: document.querySelector("#strategy-next-signal"),
+  strategyPlay: document.querySelector("#strategy-play"),
+  strategySlower: document.querySelector("#strategy-slower"),
+  strategyFaster: document.querySelector("#strategy-faster"),
+  strategySpeed: document.querySelector("#strategy-speed"),
+  strategyPosition: document.querySelector("#strategy-position"),
+  strategySession: document.querySelector("#strategy-session"),
+  strategyEvent: document.querySelector("#strategy-event"),
+  strategySummary: document.querySelector("#strategy-summary"),
+  strategyChart: document.querySelector("#strategy-chart"),
+  strategyPositionPanel: document.querySelector("#strategy-position-panel"),
+  strategySignals: document.querySelector("#strategy-signals"),
+  strategyPnlReadout: document.querySelector("#strategy-pnl-readout"),
+  strategyTradeCount: document.querySelector("#strategy-trade-count"),
 };
 
 function preferredTheme() {
@@ -187,17 +229,23 @@ async function loadOrderbooks() {
 async function loadReplayDates() {
   el.replayDate.disabled = true;
   el.chartDate.disabled = true;
+  el.strategyDate.disabled = true;
   el.replayLoad.disabled = true;
   el.chartLoad.disabled = true;
+  el.strategyLoad.disabled = true;
   el.replayDate.innerHTML = `<option value="">Loading</option>`;
   el.chartDate.innerHTML = `<option value="">Loading</option>`;
+  el.strategyDate.innerHTML = `<option value="">Loading</option>`;
   const payload = await fetchJson("/api/replay-dates");
   state.replay.dates = payload.dates || [];
   state.chart.dates = state.replay.dates;
+  state.strategy.dates = state.replay.dates;
   renderReplayDates();
   renderChartDates();
+  renderStrategyDates();
   el.replayLoad.disabled = false;
   el.chartLoad.disabled = false;
+  el.strategyLoad.disabled = false;
 }
 
 function renderSessionOptions(select, dates, currentDate) {
@@ -332,6 +380,7 @@ function setView(view) {
   el.tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.view === view));
   el.views.forEach((panel) => panel.classList.toggle("active", panel.id === `${view}-view`));
   if (view === "chart") requestAnimationFrame(drawCandles);
+  if (view === "strategy") requestAnimationFrame(drawStrategyChart);
 }
 
 async function loadEvents() {
@@ -829,6 +878,12 @@ function stopChartPlayback() {
 
 async function runChartPlayback() {
   if (!state.chart.playing) return;
+  const batch = currentChartBatch();
+  for (let i = 0; i < batch - 1; i += 1) {
+    const skipEvent = await stepChart(1, { render: false });
+    if (!skipEvent) { stopChartPlayback(); return; }
+    if (!state.chart.playing) return;
+  }
   const event = await stepChart(1);
   if (!event) {
     stopChartPlayback();
@@ -839,6 +894,10 @@ async function runChartPlayback() {
 
 function currentChartDelay() {
   return CHART_SPEEDS[state.chart.speedIndex].delay;
+}
+
+function currentChartBatch() {
+  return CHART_SPEEDS[state.chart.speedIndex].batch ?? 1;
 }
 
 function adjustChartSpeed(delta) {
@@ -984,6 +1043,692 @@ function drawCandles() {
   renderChartSummary();
 }
 
+// ============================================================================
+// Strategy Replay tab
+// ============================================================================
+
+function renderStrategyDates() {
+  const nextDate = renderSessionOptions(el.strategyDate, state.strategy.dates, state.strategy.date);
+  el.strategyDate.disabled = false;
+  setStrategyDate(nextDate);
+}
+
+function setStrategyDate(date) {
+  stopStrategyPlayback();
+  state.strategy.date = date;
+  el.strategyDate.value = date;
+  resetStrategyState();
+  renderStrategySession();
+  renderStrategyEvent();
+  renderStrategyPosition();
+  renderSignalsLog();
+  drawStrategyChart();
+}
+
+function resetStrategyState() {
+  state.strategy.session = null;
+  state.strategy.events = [];
+  state.strategy.total = 0;
+  state.strategy.firstTsEvent = null;
+  state.strategy.lastTsEvent = null;
+  state.strategy.offset = 0;
+  state.strategy.index = -1;
+  state.strategy.lastEvent = null;
+  state.strategy.lastTradePrice = null;
+  state.strategy.timelineIndex = 0;
+  state.strategy.appliedEvents = [];
+  state.strategy.position = null;
+  state.strategy.realizedPnl = 0;
+  state.strategy.buildingBar = null;
+}
+
+async function loadStrategySession() {
+  if (!state.strategy.date) return;
+  if (state.strategy.sessionLoading) return;
+  state.strategy.sessionLoading = true;
+  setStrategyButtonsDisabled(true);
+  el.strategyEvent.textContent = "Running engine...";
+  try {
+    const params = new URLSearchParams({ date: state.strategy.date });
+    const payload = await fetchJson(`/api/strategy-session?${params}`);
+    state.strategy.session = payload;
+    resetTimelineApplication();
+    await loadStrategyChunk();
+    renderStrategySession();
+    renderStrategyEvent();
+    renderStrategyPosition();
+    renderSignalsLog();
+    drawStrategyChart();
+  } finally {
+    state.strategy.sessionLoading = false;
+    setStrategyButtonsDisabled(false);
+  }
+}
+
+function resetTimelineApplication() {
+  state.strategy.timelineIndex = 0;
+  state.strategy.appliedEvents = [];
+  state.strategy.position = null;
+  state.strategy.realizedPnl = 0;
+  state.strategy.lastTradePrice = null;
+  state.strategy.buildingBar = null;
+}
+
+async function loadStrategyChunk({ preserveProgress = false } = {}) {
+  if (state.strategy.chunkLoading) return;
+  state.strategy.chunkLoading = true;
+  try {
+    const limit = Number(el.strategyLimit.value || 5000);
+    const offset = state.strategy.offset;
+    const params = new URLSearchParams({
+      date: state.strategy.date,
+      offset: String(offset),
+      limit: String(limit),
+      rth_only: "true",
+    });
+    const payload = await fetchJson(`/api/replay?${params}`);
+    state.strategy.events = payload.events;
+    state.strategy.total = payload.total;
+    state.strategy.firstTsEvent = payload.first_ts_event;
+    state.strategy.lastTsEvent = payload.last_ts_event;
+    state.strategy.offset = payload.offset;
+    if (!preserveProgress) {
+      state.strategy.index = -1;
+      state.strategy.lastEvent = null;
+    }
+  } finally {
+    state.strategy.chunkLoading = false;
+  }
+}
+
+async function advanceToNextStrategyDate() {
+  if (state.strategy.sessionLoading) return false;
+  const dates = (state.strategy.dates || []).map((d) => d.date);
+  const currentIdx = dates.indexOf(state.strategy.date);
+  if (currentIdx < 0 || currentIdx + 1 >= dates.length) return false;
+  const nextDate = dates[currentIdx + 1];
+  state.strategy.sessionLoading = true;
+  try {
+    state.strategy.date = nextDate;
+    el.strategyDate.value = nextDate;
+    const params = new URLSearchParams({ date: nextDate });
+    const payload = await fetchJson(`/api/strategy-session?${params}`);
+    state.strategy.session = payload;
+    resetTimelineApplication();
+    state.strategy.offset = 0;
+    state.strategy.index = -1;
+    state.strategy.events = [];
+    state.strategy.lastEvent = null;
+    await loadStrategyChunk();
+    renderStrategySession();
+    return true;
+  } finally {
+    state.strategy.sessionLoading = false;
+  }
+}
+
+async function stepStrategy(direction, { render = true } = {}) {
+  if (direction < 0) return null;
+  if (state.strategy.chunkLoading) return null;
+  if (!state.strategy.events.length) {
+    await loadStrategyChunk();
+    if (!state.strategy.events.length) return null;
+  }
+
+  const nextIndex = state.strategy.index + 1;
+  if (nextIndex >= state.strategy.events.length) {
+    const nextOffset = state.strategy.offset + state.strategy.events.length;
+    if (nextOffset >= state.strategy.total) {
+      const advanced = await advanceToNextStrategyDate();
+      if (!advanced) {
+        stopStrategyPlayback();
+        return null;
+      }
+      return stepStrategy(1, { render });
+    }
+    state.strategy.offset = nextOffset;
+    await loadStrategyChunk({ preserveProgress: true });
+    state.strategy.index = -1;
+    return stepStrategy(1, { render });
+  }
+
+  state.strategy.index = nextIndex;
+  const event = state.strategy.events[state.strategy.index];
+  state.strategy.lastEvent = event;
+  applyStrategyEvent(event);
+
+  if (render) {
+    renderStrategyEvent(event);
+    renderStrategyPosition();
+    renderSignalsLog();
+    drawStrategyChart();
+  }
+  return event;
+}
+
+function applyStrategyEvent(event) {
+  if (isTradeEvent(event)) {
+    state.strategy.lastTradePrice = Number(event.price_display);
+  }
+  updateStrategyBuildingBar(event);
+  const timeline = state.strategy.session?.timeline || [];
+  const eventTime = new Date(event.ts_event).getTime();
+  while (state.strategy.timelineIndex < timeline.length) {
+    const next = timeline[state.strategy.timelineIndex];
+    const nextTime = new Date(next.ts).getTime();
+    if (nextTime > eventTime) break;
+    applyTimelineEvent(next);
+    state.strategy.timelineIndex += 1;
+  }
+}
+
+function updateStrategyBuildingBar(event) {
+  if (!isTradeEvent(event)) return;
+  const bars = state.strategy.session?.bars || [];
+  const closed = closedBarCountAtCurrent();
+  const openBar = bars[closed];
+  if (!openBar) {
+    state.strategy.buildingBar = null;
+    return;
+  }
+  const price = Number(event.price_display);
+  if (!Number.isFinite(price)) return;
+  const eventMs = new Date(event.ts_event).getTime();
+  const startMs = new Date(openBar.bar_start).getTime();
+  const endMs = new Date(openBar.bar_end).getTime();
+  if (eventMs < startMs || eventMs >= endMs) return;
+  const size = Number(event.size || 0);
+  let building = state.strategy.buildingBar;
+  if (!building || building.start !== openBar.bar_start) {
+    building = {
+      start: openBar.bar_start,
+      end: openBar.bar_end,
+      open: price,
+      high: price,
+      low: price,
+      close: price,
+      volume: 0,
+      inProgress: true,
+    };
+    state.strategy.buildingBar = building;
+  }
+  if (price > building.high) building.high = price;
+  if (price < building.low) building.low = price;
+  building.close = price;
+  building.volume += size;
+}
+
+function applyTimelineEvent(entry) {
+  const record = { ...entry };
+  state.strategy.appliedEvents.push(record);
+
+  if (entry.type === "fill") {
+    state.strategy.position = {
+      side: entry.side,
+      qty: entry.qty,
+      entry: entry.price,
+      stop: entry.stop,
+      target: entry.target,
+      breakevenMoved: false,
+    };
+  } else if (entry.type === "breakeven") {
+    if (state.strategy.position) {
+      state.strategy.position.stop = entry.stop;
+      state.strategy.position.breakevenMoved = true;
+    }
+  } else if (entry.type === "exit") {
+    state.strategy.realizedPnl += entry.pnl_usd || 0;
+    record.win = (entry.pnl_usd || 0) > 0;
+    record.loss = (entry.pnl_usd || 0) < 0;
+    state.strategy.position = null;
+  }
+}
+
+function currentAbsoluteOffset() {
+  return state.strategy.offset + Math.max(0, state.strategy.index);
+}
+
+async function seekStrategy(targetOffset) {
+  if (targetOffset == null || targetOffset < 0) return null;
+  if (targetOffset >= state.strategy.total) {
+    stopStrategyPlayback();
+    return null;
+  }
+  state.strategy.offset = targetOffset;
+  state.strategy.index = -1;
+  state.strategy.events = [];
+  state.strategy.buildingBar = null;
+  await loadStrategyChunk({ preserveProgress: false });
+  return stepStrategy(1, { render: false });
+}
+
+async function advanceStrategyToNextBar({ render = true } = {}) {
+  const bars = state.strategy.session?.bars || [];
+  const nextBarIdx = closedBarCountAtCurrent();
+  if (nextBarIdx >= bars.length) return null;
+  const target = bars[nextBarIdx];
+  if (target.event_offset == null) {
+    const startBars = nextBarIdx;
+    for (let i = 0; i < 1_000_000; i += 1) {
+      const event = await stepStrategy(1, { render: false });
+      if (!event) return null;
+      if (closedBarCountAtCurrent() > startBars) break;
+    }
+  } else {
+    await seekStrategy(target.event_offset);
+  }
+  const event = state.strategy.lastEvent;
+  if (render && event) {
+    renderStrategyEvent(event);
+    renderStrategyPosition();
+    renderSignalsLog();
+    drawStrategyChart();
+  }
+  return event;
+}
+
+async function stepStrategyToNextBar() {
+  stopStrategyPlayback();
+  setStrategyButtonsDisabled(true);
+  try {
+    await advanceStrategyToNextBar({ render: true });
+  } finally {
+    setStrategyButtonsDisabled(false);
+  }
+}
+
+async function stepStrategyToNextSignal() {
+  stopStrategyPlayback();
+  setStrategyButtonsDisabled(true);
+  try {
+    const timeline = state.strategy.session?.timeline || [];
+    const currentOffset = currentAbsoluteOffset();
+    const next = timeline.find(
+      (e) => e.event_offset != null && e.event_offset > currentOffset
+    );
+    if (!next) return;   // no more strategy events for this session
+    await seekStrategy(next.event_offset);
+  } finally {
+    setStrategyButtonsDisabled(false);
+    renderStrategyEvent(state.strategy.lastEvent);
+    renderStrategyPosition();
+    renderSignalsLog();
+    drawStrategyChart();
+  }
+}
+
+function closedBarCountAtCurrent() {
+  const event = state.strategy.lastEvent;
+  const bars = state.strategy.session?.bars || [];
+  if (!event || !bars.length) return 0;
+  const cutoff = new Date(event.ts_event).getTime();
+  let count = 0;
+  for (const bar of bars) {
+    if (new Date(bar.bar_end).getTime() <= cutoff) count += 1;
+    else break;
+  }
+  return count;
+}
+
+function renderStrategySession() {
+  if (!state.strategy.session) {
+    el.strategySession.textContent = state.strategy.date
+      ? "Click Load to run engine for this session."
+      : "Choose a session and load.";
+    el.strategySummary.textContent = "No data";
+    return;
+  }
+  const s = state.strategy.session.summary || {};
+  el.strategySession.innerHTML = `
+    <dl>
+      <div><dt>Date</dt><dd>${state.strategy.session.date}</dd></div>
+      <div><dt>Instrument</dt><dd>${state.strategy.session.instrument}</dd></div>
+      <div><dt>Bars</dt><dd>${formatNumber(state.strategy.session.bars.length)}</dd></div>
+      <div><dt>Engine Trades</dt><dd>${formatNumber(s.trade_count || 0)} (${formatNumber(s.wins || 0)}W / ${formatNumber(s.losses || 0)}L)</dd></div>
+      <div><dt>Engine P&amp;L</dt><dd class="${(s.total_pnl_usd || 0) >= 0 ? "pnl-positive" : "pnl-negative"}">${formatPnl(s.total_pnl_usd || 0)}</dd></div>
+      <div><dt>Events</dt><dd>${formatNumber(state.strategy.total)}</dd></div>
+    </dl>
+  `;
+}
+
+function renderStrategyEvent(event = state.strategy.lastEvent) {
+  const absoluteRow = event ? event.row + 1 : state.strategy.offset;
+  el.strategyPosition.textContent = `${formatNumber(absoluteRow)} / ${formatNumber(state.strategy.total)}`;
+  renderStrategySummary();
+  if (!event) {
+    el.strategyEvent.textContent = state.strategy.session
+      ? "Step or play to walk events."
+      : "Load a session to begin.";
+    return;
+  }
+  const trade = isTradeEvent(event);
+  el.strategyEvent.innerHTML = `
+    <dl>
+      <div><dt>Time</dt><dd>${formatTime(event.ts_event)}</dd></div>
+      <div><dt>Action</dt><dd>${event.action}</dd></div>
+      <div><dt>Price</dt><dd>${formatPrice(event.price_display)}</dd></div>
+      <div><dt>Size</dt><dd>${formatNumber(event.size)}</dd></div>
+      <div><dt>Trade?</dt><dd>${trade ? "Yes" : "No"}</dd></div>
+      <div><dt>Last Trade</dt><dd>${formatPrice(state.strategy.lastTradePrice)}</dd></div>
+    </dl>
+  `;
+}
+
+function renderStrategySummary() {
+  if (!state.strategy.session) {
+    el.strategySummary.textContent = "No data";
+    return;
+  }
+  const closed = closedBarCountAtCurrent();
+  const lastBar = state.strategy.session.bars[Math.max(0, closed - 1)];
+  if (!lastBar) {
+    el.strategySummary.textContent = `${formatNumber(closed)} bars`;
+    return;
+  }
+  el.strategySummary.textContent = [
+    `${formatNumber(closed)} bars`,
+    `buff ${formatPrice(lastBar.buff)}`,
+    `atr ${lastBar.atr ? lastBar.atr.toFixed(2) : "—"}`,
+    `rsi ${lastBar.rsi ? lastBar.rsi.toFixed(1) : "—"}`,
+    `dir ${lastBar.dir > 0 ? "▲" : lastBar.dir < 0 ? "▼" : "·"}`,
+  ].join(" · ");
+}
+
+function renderStrategyPosition() {
+  const pos = state.strategy.position;
+  const realized = state.strategy.realizedPnl;
+  el.strategyPnlReadout.textContent = `Realized ${formatPnl(realized)}`;
+  el.strategyTradeCount.textContent = `${formatNumber(state.strategy.appliedEvents.length)} events`;
+
+  if (!pos) {
+    el.strategyPositionPanel.className = "position-panel flat";
+    el.strategyPositionPanel.textContent = state.strategy.session
+      ? "Flat."
+      : "No position.";
+    return;
+  }
+  const sideClass = pos.side.toLowerCase();
+  const mark = state.strategy.lastTradePrice;
+  let unreal = null;
+  let unrealClass = "";
+  if (mark != null) {
+    const delta = pos.side === "LONG" ? mark - pos.entry : pos.entry - mark;
+    // MES tick = 0.25 = $1.25 / tick = $5 / point
+    unreal = delta * 5 * pos.qty;
+    unrealClass = unreal >= 0 ? "pnl-positive" : "pnl-negative";
+  }
+  el.strategyPositionPanel.className = `position-panel ${sideClass}`;
+  el.strategyPositionPanel.innerHTML = `
+    <dl>
+      <div><dt>Side</dt><dd>${pos.side} × ${pos.qty}</dd></div>
+      <div><dt>Entry</dt><dd>${formatPrice(pos.entry)}</dd></div>
+      <div><dt>Stop ${pos.breakevenMoved ? "(BE)" : ""}</dt><dd>${formatPrice(pos.stop)}</dd></div>
+      <div><dt>Target</dt><dd>${formatPrice(pos.target)}</dd></div>
+      <div><dt>Mark</dt><dd>${formatPrice(mark)}</dd></div>
+      <div><dt>Unrealized</dt><dd class="${unrealClass}">${unreal != null ? formatPnl(unreal) : "—"}</dd></div>
+    </dl>
+  `;
+}
+
+function renderSignalsLog() {
+  const events = state.strategy.appliedEvents;
+  if (!events.length) {
+    el.strategySignals.className = "signals-log empty";
+    el.strategySignals.textContent = "No events fired yet.";
+    return;
+  }
+  el.strategySignals.className = "signals-log";
+  const items = events.map((entry) => {
+    const time = formatTime(entry.ts).slice(11, 19);
+    const cls = entry.win ? "win" : entry.loss ? "loss" : "";
+    const typeCls = `ev-${entry.type === "entry_skipped" ? "skipped" : entry.type === "gap_filter_active" || entry.type === "gap_resolved" ? "gap" : entry.type}`;
+    let detail = "";
+    if (entry.type === "signal") {
+      detail = `${entry.side} @ ${formatPrice(entry.trigger_close)}`;
+    } else if (entry.type === "fill") {
+      detail = `${entry.side} ${entry.qty} @ ${formatPrice(entry.price)} (stop ${formatPrice(entry.stop)}, tgt ${formatPrice(entry.target)})`;
+    } else if (entry.type === "exit") {
+      detail = `${entry.side} @ ${formatPrice(entry.exit_price)} (${entry.reason}) ${formatPnl(entry.pnl_usd)}`;
+    } else if (entry.type === "breakeven") {
+      detail = `Stop → ${formatPrice(entry.stop)}`;
+    } else if (entry.type === "entry_skipped") {
+      detail = `${entry.reason}${entry.risk_ticks ? ` (${entry.risk_ticks.toFixed(1)} ticks, cap ${entry.cap})` : ""}`;
+    } else {
+      detail = JSON.stringify(entry);
+    }
+    return `<li class="${cls}"><span class="ev-time">${time}</span><span class="ev-type ${typeCls}">${entry.type}</span> ${detail}</li>`;
+  }).reverse().join("");
+  el.strategySignals.innerHTML = `<ul>${items}</ul>`;
+}
+
+function formatPnl(value) {
+  if (value === null || value === undefined || Number.isNaN(value)) return "—";
+  const sign = value >= 0 ? "+" : "−";
+  return `${sign}$${Math.abs(value).toFixed(2)}`;
+}
+
+function setStrategyButtonsDisabled(disabled) {
+  el.strategyLoad.disabled = disabled;
+  el.strategyStep.disabled = disabled;
+  el.strategyNextBar.disabled = disabled;
+  el.strategyNextSignal.disabled = disabled;
+  el.strategyPlay.disabled = disabled;
+  el.strategySlower.disabled = disabled && !state.strategy.playing;
+  el.strategyFaster.disabled = disabled && !state.strategy.playing;
+  updateStrategySpeedControls();
+}
+
+function startStrategyPlayback() {
+  if (state.strategy.playing) return;
+  state.strategy.playing = true;
+  el.strategyPlay.textContent = "Pause";
+  runStrategyPlayback();
+}
+
+function stopStrategyPlayback() {
+  state.strategy.playing = false;
+  el.strategyPlay.textContent = "Play";
+  if (state.strategy.timer) {
+    clearTimeout(state.strategy.timer);
+    state.strategy.timer = null;
+  }
+}
+
+async function runStrategyPlayback() {
+  if (!state.strategy.playing) return;
+  const batch = currentStrategyBatch();
+  for (let i = 0; i < batch - 1; i += 1) {
+    const skipEvent = await stepStrategy(1, { render: false });
+    if (!skipEvent) { stopStrategyPlayback(); return; }
+    if (!state.strategy.playing) return;
+  }
+  const event = await stepStrategy(1);
+  if (!event) { stopStrategyPlayback(); return; }
+  state.strategy.timer = setTimeout(runStrategyPlayback, currentStrategyDelay());
+}
+
+function currentStrategyDelay() {
+  return CHART_SPEEDS[state.strategy.speedIndex].delay;
+}
+
+function currentStrategyBatch() {
+  return CHART_SPEEDS[state.strategy.speedIndex].batch ?? 1;
+}
+
+function adjustStrategySpeed(delta) {
+  const nextIndex = Math.max(0, Math.min(CHART_SPEEDS.length - 1, state.strategy.speedIndex + delta));
+  state.strategy.speedIndex = nextIndex;
+  updateStrategySpeedControls();
+}
+
+function updateStrategySpeedControls() {
+  const speed = CHART_SPEEDS[state.strategy.speedIndex];
+  el.strategySpeed.textContent = speed.label;
+  el.strategySlower.disabled = state.strategy.speedIndex === 0 || (state.strategy.chunkLoading && !state.strategy.playing);
+  el.strategyFaster.disabled = state.strategy.speedIndex === CHART_SPEEDS.length - 1 || (state.strategy.chunkLoading && !state.strategy.playing);
+}
+
+function drawStrategyChart() {
+  const canvas = el.strategyChart;
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = Math.floor(rect.width * ratio);
+  canvas.height = Math.floor(rect.height * ratio);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+
+  const width = rect.width;
+  const height = rect.height;
+  const surface = themeColor("--surface");
+  const text = themeColor("--text");
+  const muted = themeColor("--muted");
+  const line = themeColor("--line");
+  const bid = themeColor("--bid");
+  const ask = themeColor("--ask");
+  const accent = themeColor("--accent-2");
+
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = surface;
+  ctx.fillRect(0, 0, width, height);
+
+  const plot = { left: 14, right: width - 76, top: 18, bottom: height - 34 };
+  const plotWidth = Math.max(1, plot.right - plot.left);
+  const plotHeight = Math.max(1, plot.bottom - plot.top);
+
+  const bars = state.strategy.session?.bars || [];
+  const closed = closedBarCountAtCurrent();
+  const closedBars = bars.slice(0, closed);
+  const building = state.strategy.buildingBar;
+  const combined = building ? closedBars.concat([building]) : closedBars;
+  const visible = combined.slice(-CHART_VISIBLE_CANDLES);
+
+  ctx.font = "12px Inter, ui-sans-serif, system-ui, sans-serif";
+  ctx.textBaseline = "middle";
+
+  if (!visible.length) {
+    ctx.fillStyle = muted;
+    ctx.textAlign = "center";
+    ctx.fillText(state.strategy.session ? "No bars yet — step forward" : "Load a session", width / 2, height / 2);
+    return;
+  }
+
+  const pos = state.strategy.position;
+  let minPrice = Infinity, maxPrice = -Infinity;
+  for (const bar of visible) {
+    if (bar.low < minPrice) minPrice = bar.low;
+    if (bar.high > maxPrice) maxPrice = bar.high;
+    if (bar.buff != null) {
+      if (bar.buff < minPrice) minPrice = bar.buff;
+      if (bar.buff > maxPrice) maxPrice = bar.buff;
+    }
+  }
+  if (pos) {
+    minPrice = Math.min(minPrice, pos.stop, pos.target);
+    maxPrice = Math.max(maxPrice, pos.stop, pos.target);
+  }
+  if (minPrice === maxPrice) { minPrice -= 1; maxPrice += 1; }
+  const padding = (maxPrice - minPrice) * 0.08;
+  minPrice -= padding;
+  maxPrice += padding;
+
+  const priceToY = (price) => plot.top + ((maxPrice - price) / (maxPrice - minPrice)) * plotHeight;
+
+  // gridlines + price axis labels
+  ctx.strokeStyle = line;
+  ctx.fillStyle = muted;
+  ctx.textAlign = "left";
+  for (let index = 0; index <= 4; index += 1) {
+    const y = plot.top + (plotHeight / 4) * index;
+    const price = maxPrice - ((maxPrice - minPrice) / 4) * index;
+    ctx.beginPath();
+    ctx.moveTo(plot.left, y);
+    ctx.lineTo(plot.right, y);
+    ctx.stroke();
+    ctx.fillText(formatPrice(price), plot.right + 8, y);
+  }
+
+  const spacing = plotWidth / visible.length;
+  const bodyWidth = Math.max(3, Math.min(12, spacing * 0.58));
+
+  // candles
+  visible.forEach((bar, index) => {
+    const x = plot.left + spacing * index + spacing / 2;
+    const yOpen = priceToY(bar.open);
+    const yClose = priceToY(bar.close);
+    const yHigh = priceToY(bar.high);
+    const yLow = priceToY(bar.low);
+    const up = bar.close >= bar.open;
+    const color = up ? bid : ask;
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    if (bar.inProgress) ctx.globalAlpha = 0.55;
+    ctx.beginPath();
+    ctx.moveTo(x, yHigh); ctx.lineTo(x, yLow); ctx.stroke();
+    const bodyTop = Math.min(yOpen, yClose);
+    const bodyHeight = Math.max(2, Math.abs(yClose - yOpen));
+    ctx.fillRect(x - bodyWidth / 2, bodyTop, bodyWidth, bodyHeight);
+    ctx.globalAlpha = 1;
+  });
+
+  // buff line overlay
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  let started = false;
+  visible.forEach((bar, index) => {
+    if (bar.buff == null) return;
+    const x = plot.left + spacing * index + spacing / 2;
+    const y = priceToY(bar.buff);
+    if (!started) { ctx.moveTo(x, y); started = true; }
+    else ctx.lineTo(x, y);
+  });
+  if (started) ctx.stroke();
+  ctx.lineWidth = 1;
+
+  // position lines (entry / stop / target)
+  if (pos) {
+    const drawLevel = (price, color, label) => {
+      const y = priceToY(price);
+      ctx.strokeStyle = color;
+      ctx.setLineDash([6, 4]);
+      ctx.beginPath();
+      ctx.moveTo(plot.left, y); ctx.lineTo(plot.right, y); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = color;
+      ctx.textAlign = "left";
+      ctx.fillText(label, plot.left + 4, y - 8);
+    };
+    drawLevel(pos.entry, text, `entry ${formatPrice(pos.entry)}`);
+    drawLevel(pos.target, bid, `target ${formatPrice(pos.target)}`);
+    drawLevel(pos.stop, ask, `stop ${formatPrice(pos.stop)}`);
+  }
+
+  // last close marker
+  const last = visible[visible.length - 1];
+  const lastY = priceToY(last.close);
+  ctx.strokeStyle = text;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  ctx.moveTo(plot.left, lastY); ctx.lineTo(plot.right, lastY); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = text;
+  ctx.textAlign = "left";
+  ctx.fillText(formatPrice(last.close), plot.right + 8, lastY);
+
+  // axis time labels
+  ctx.fillStyle = muted;
+  ctx.textBaseline = "alphabetic";
+  ctx.textAlign = "left";
+  ctx.fillText(formatTime(visible[0].bar_start).slice(11, 16), plot.left, height - 12);
+  ctx.textAlign = "right";
+  ctx.fillText(formatTime(last.bar_start).slice(11, 16), plot.right, height - 12);
+
+  renderStrategySummary();
+}
+
 el.filter.addEventListener("input", renderOrderbooks);
 el.refresh.addEventListener("click", loadOrderbooks);
 el.themeToggle.addEventListener("click", () => {
@@ -1031,13 +1776,30 @@ el.chartOffset.addEventListener("keydown", (event) => {
 el.chartLimit.addEventListener("keydown", (event) => {
   if (event.key === "Enter") handleChartLoad();
 });
-window.addEventListener("resize", drawCandles);
+
+el.strategyDate.addEventListener("change", () => setStrategyDate(el.strategyDate.value));
+el.strategyLoad.addEventListener("click", () => loadStrategySession());
+el.strategyStep.addEventListener("click", () => stepStrategy(1));
+el.strategyNextBar.addEventListener("click", () => stepStrategyToNextBar());
+el.strategyNextSignal.addEventListener("click", () => stepStrategyToNextSignal());
+el.strategyPlay.addEventListener("click", () => {
+  if (state.strategy.playing) stopStrategyPlayback();
+  else startStrategyPlayback();
+});
+el.strategySlower.addEventListener("click", () => adjustStrategySpeed(-1));
+el.strategyFaster.addEventListener("click", () => adjustStrategySpeed(1));
+
+window.addEventListener("resize", () => {
+  drawCandles();
+  drawStrategyChart();
+});
 
 setTheme(preferredTheme());
 async function initDashboard() {
   await loadReplayDates();
   await loadOrderbooks();
   updateChartSpeedControls();
+  updateStrategySpeedControls();
 }
 
 initDashboard().catch((error) => {
