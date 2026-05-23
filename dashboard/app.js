@@ -12,10 +12,11 @@ const state = {
     lastTsEvent: null,
     offset: 0,
     index: -1,
-    orders: new Map(),
-    bids: new Map(),
-    asks: new Map(),
+    books: [],               // per-event book snapshots from the engine
     loading: false,
+    playing: false,
+    timer: null,
+    speedIndex: 5,           // default 8x — the book fills/animates visibly
   },
   chart: {
     dates: [],
@@ -60,7 +61,6 @@ const state = {
 };
 
 const F_LAST = 128;
-const BOOK_LEVEL_LIMIT = 100;
 const CHART_VISIBLE_CANDLES = 90;
 const CHART_SPEEDS = [
   { label: "0.25x", delay: 240, batch: 1 },
@@ -114,6 +114,10 @@ const el = {
   replayLoad: document.querySelector("#replay-load"),
   replayPrev: document.querySelector("#replay-prev"),
   replayNext: document.querySelector("#replay-next"),
+  replayPlay: document.querySelector("#replay-play"),
+  replaySlower: document.querySelector("#replay-slower"),
+  replayFaster: document.querySelector("#replay-faster"),
+  replaySpeed: document.querySelector("#replay-speed"),
   replayPosition: document.querySelector("#replay-position"),
   replaySession: document.querySelector("#replay-session"),
   currentEvent: document.querySelector("#current-event"),
@@ -291,6 +295,7 @@ function renderChartDates() {
 }
 
 function setReplayDate(date) {
+  stopReplayPlayback();
   state.replay.date = date;
   el.replayDate.value = date;
   el.replayOffset.value = 0;
@@ -436,98 +441,20 @@ function renderTable(kind, rows) {
   }
 }
 
+// The book is reconstructed server-side by engine/orderbook.py and delivered
+// as per-event snapshots in state.replay.books — there is no client-side book
+// math any more. clearReplayBook just resets the local view.
 function clearReplayBook() {
-  state.replay.orders = new Map();
-  state.replay.bids = new Map();
-  state.replay.asks = new Map();
-}
-
-function levelMap(side) {
-  return side === "B" ? state.replay.bids : state.replay.asks;
-}
-
-function adjustLevel(side, price, sizeDelta, countDelta) {
-  if (side !== "A" && side !== "B") return;
-  if (price === null || price === undefined) return;
-  const levels = levelMap(side);
-  const current = levels.get(price) || { size: 0, count: 0 };
-  current.size += sizeDelta;
-  current.count += countDelta;
-  if (current.size <= 0 || current.count <= 0) {
-    levels.delete(price);
-  } else {
-    levels.set(price, current);
-  }
-}
-
-function removeOrder(orderId) {
-  const existing = state.replay.orders.get(orderId);
-  if (!existing) return null;
-  adjustLevel(existing.side, existing.price, -existing.size, -1);
-  state.replay.orders.delete(orderId);
-  return existing;
-}
-
-function addOrder(event) {
-  if (event.side !== "A" && event.side !== "B") return null;
-  if (!event.order_id || event.price_display === null || event.price_display === undefined) return null;
-  removeOrder(event.order_id);
-  const order = {
-    side: event.side,
-    price: event.price_display,
-    size: event.size,
-    ts_event: event.ts_event,
-  };
-  state.replay.orders.set(event.order_id, order);
-  adjustLevel(order.side, order.price, order.size, 1);
-  return order;
-}
-
-function applyReplayEvent(event) {
-  const action = event.action;
-  const orderId = event.order_id;
-  const before = state.replay.orders.get(orderId);
-
-  if (action === "R") {
-    const removed = state.replay.orders.size;
-    clearReplayBook();
-    return `Cleared ${formatNumber(removed)} resting orders.`;
-  }
-
-  if (action === "A") {
-    const order = addOrder(event);
-    if (!order) return "Add carried no resting order to insert.";
-    return `Added ${formatNumber(order.size)} @ ${formatPrice(order.price)} on ${sideName(order.side)}.`;
-  }
-
-  if (action === "C") {
-    if (!before) return "Cancel referenced an order that is not in the local replay state.";
-    const cancelSize = Math.min(event.size, before.size);
-    adjustLevel(before.side, before.price, -cancelSize, cancelSize === before.size ? -1 : 0);
-    before.size -= cancelSize;
-    if (before.size <= 0) state.replay.orders.delete(orderId);
-    return `Canceled ${formatNumber(cancelSize)} from ${sideName(before.side)} order ${orderId}.`;
-  }
-
-  if (action === "M") {
-    const old = removeOrder(orderId);
-    const updated = addOrder(event);
-    if (!old && updated) {
-      return `Modified order was not present locally, inserted ${formatNumber(updated.size)} @ ${formatPrice(updated.price)}.`;
-    }
-    if (!updated) return "Modify removed or could not recreate the resting order.";
-    return `Modified ${orderId} from ${formatNumber(old.size)} @ ${formatPrice(old.price)} to ${formatNumber(updated.size)} @ ${formatPrice(updated.price)}.`;
-  }
-
-  if (action === "T" || action === "F" || action === "N") {
-    return `${action} does not change resting order state.`;
-  }
-
-  return `Unhandled action ${action}.`;
+  state.replay.books = [];
+  el.bookBody.innerHTML = "";
+  el.bookCounts.textContent = "";
 }
 
 async function loadReplayChunk({ preserveBook = false } = {}) {
   if (state.replay.loading) return;
+  // A fresh manual load restarts the book; pause any running playback.
+  // The chunk-boundary reload (preserveBook) keeps playing across chunks.
+  if (!preserveBook) stopReplayPlayback();
   state.replay.loading = true;
   el.replayLoad.disabled = true;
   el.replayNext.disabled = true;
@@ -542,18 +469,27 @@ async function loadReplayChunk({ preserveBook = false } = {}) {
       limit: String(limit),
     });
     if (el.replayDate.value) params.set("date", el.replayDate.value);
-    const payload = await fetchJson(`/api/replay?${params}`);
+    // cont=true continues the engine's book across a chunk boundary (playback);
+    // a fresh manual load starts the book anew on the server.
+    if (preserveBook) params.set("cont", "true");
+    const payload = await fetchJson(`/api/book-replay?${params}`);
     state.replay.date = payload.date || el.replayDate.value || "";
     state.replay.events = payload.events;
+    state.replay.books = payload.books || [];
     state.replay.total = payload.total;
     state.replay.firstTsEvent = payload.first_ts_event;
     state.replay.lastTsEvent = payload.last_ts_event;
     state.replay.offset = payload.offset;
     state.replay.index = -1;
-    if (!preserveBook) clearReplayBook();
     renderReplaySession();
     renderReplay();
-    if (state.replay.events.length) stepReplay(1);
+    if (state.replay.events.length) {
+      if (preserveBook) {
+        stepReplay(1);                 // continuing playback: next event
+      } else {
+        primeReplayToPopulatedBook();  // fresh load: skip the empty warmup
+      }
+    }
   } finally {
     state.replay.loading = false;
     el.replayLoad.disabled = false;
@@ -562,25 +498,89 @@ async function loadReplayChunk({ preserveBook = false } = {}) {
   }
 }
 
-async function stepReplay(direction) {
+// On a fresh chunk the book starts empty (event 0 is usually the R snapshot
+// clear), so render the first event whose book has both sides populated. This
+// way the user sees a real ladder immediately instead of an empty book.
+function primeReplayToPopulatedBook() {
+  const books = state.replay.books;
+  let i = 0;
+  for (; i < books.length; i += 1) {
+    const b = books[i];
+    if (b && b.bids.length > 0 && b.asks.length > 0) break;
+  }
+  if (i >= books.length) i = 0;  // never populated; just show the first event
+  state.replay.index = i;
+  const event = state.replay.events[i];
+  renderReplay(event, event.effect || "", books[i]);
+}
+
+async function stepReplay(direction, { render = true } = {}) {
   if (direction < 0) {
     el.eventEffect.textContent = "Previous is available within the event list, but book state replay is forward-only. Reload the chunk to restart from its first event.";
-    return;
+    return false;
   }
 
   const nextIndex = state.replay.index + 1;
   if (nextIndex >= state.replay.events.length) {
     const nextOffset = state.replay.offset + state.replay.events.length;
-    if (nextOffset >= state.replay.total) return;
+    if (nextOffset >= state.replay.total) return false;  // end of session
     el.replayOffset.value = nextOffset;
     await loadReplayChunk({ preserveBook: true });
-    return;
+    return state.replay.index >= 0;  // the reload auto-steps to its first event
   }
 
   state.replay.index = nextIndex;
   const event = state.replay.events[state.replay.index];
-  const effect = applyReplayEvent(event);
-  renderReplay(event, effect);
+  if (render) {
+    renderReplay(event, event.effect || "", state.replay.books[state.replay.index]);
+  }
+  return event;
+}
+
+async function startReplayPlayback() {
+  if (state.replay.playing) return;
+  // One-click auto replay: load the first chunk if nothing is loaded yet.
+  if (state.replay.events.length === 0) {
+    await loadReplayChunk();
+    if (state.replay.events.length === 0) return;  // empty session, nothing to play
+  }
+  state.replay.playing = true;
+  el.replayPlay.textContent = "Pause";
+  runReplayPlayback();
+}
+
+function stopReplayPlayback() {
+  state.replay.playing = false;
+  el.replayPlay.textContent = "Play";
+  if (state.replay.timer) {
+    clearTimeout(state.replay.timer);
+    state.replay.timer = null;
+  }
+}
+
+async function runReplayPlayback() {
+  if (!state.replay.playing) return;
+  // Fast speeds advance several events per tick; only the last one renders.
+  const batch = CHART_SPEEDS[state.replay.speedIndex].batch ?? 1;
+  for (let i = 0; i < batch - 1; i += 1) {
+    const advanced = await stepReplay(1, { render: false });
+    if (!advanced) { stopReplayPlayback(); return; }
+    if (!state.replay.playing) return;
+  }
+  const advanced = await stepReplay(1);
+  if (!advanced) { stopReplayPlayback(); return; }
+  state.replay.timer = setTimeout(runReplayPlayback, CHART_SPEEDS[state.replay.speedIndex].delay);
+}
+
+function adjustReplaySpeed(delta) {
+  state.replay.speedIndex = Math.max(0, Math.min(CHART_SPEEDS.length - 1, state.replay.speedIndex + delta));
+  updateReplaySpeedControls();
+}
+
+function updateReplaySpeedControls() {
+  el.replaySpeed.textContent = CHART_SPEEDS[state.replay.speedIndex].label;
+  el.replaySlower.disabled = state.replay.speedIndex === 0;
+  el.replayFaster.disabled = state.replay.speedIndex === CHART_SPEEDS.length - 1;
 }
 
 function renderReplaySession() {
@@ -599,14 +599,14 @@ function renderReplaySession() {
   `;
 }
 
-function renderReplay(event = null, effect = "") {
+function renderReplay(event = null, effect = "", book = null) {
   const absoluteRow = event ? event.row + 1 : state.replay.offset;
   el.replayPosition.textContent = `${formatNumber(absoluteRow)} / ${formatNumber(state.replay.total)}`;
 
   if (!event) {
     el.currentEvent.textContent = "Load a replay chunk to begin.";
     el.eventEffect.textContent = "";
-    renderBookLevels();
+    renderBookLevels(null);
     return;
   }
 
@@ -628,19 +628,17 @@ function renderReplay(event = null, effect = "") {
   el.eventEffect.textContent = inspectAfterEvent
     ? effect
     : `${effect} More records may belong to this normalized event.`;
-  renderBookLevels();
+  renderBookLevels(book);
 }
 
-function renderBookLevels() {
-  const bids = Array.from(state.replay.bids.entries())
-    .sort((a, b) => Number(b[0]) - Number(a[0]))
-    .slice(0, BOOK_LEVEL_LIMIT);
-  const asks = Array.from(state.replay.asks.entries())
-    .sort((a, b) => Number(a[0]) - Number(b[0]))
-    .slice(0, BOOK_LEVEL_LIMIT);
-  const rows = Math.max(BOOK_LEVEL_LIMIT, bids.length, asks.length);
+// Render a server-supplied book snapshot. Each level is [price, size, count];
+// bids arrive best-first (highest), asks best-first (lowest).
+function renderBookLevels(book) {
+  const bids = book ? book.bids : [];
+  const asks = book ? book.asks : [];
+  const rows = Math.max(bids.length, asks.length);
 
-  el.bookCounts.textContent = `${formatNumber(state.replay.orders.size)} resting orders`;
+  el.bookCounts.textContent = book ? formatBookStats(book) : "";
   el.bookBody.innerHTML = "";
   for (let index = 0; index < rows; index += 1) {
     const bid = bids[index];
@@ -649,15 +647,27 @@ function renderBookLevels() {
     const askClass = index === 0 && ask ? "best-ask" : "";
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td class="${bidClass}">${bid ? formatNumber(bid[1].count) : ""}</td>
-      <td class="${bidClass}">${bid ? formatNumber(bid[1].size) : ""}</td>
+      <td class="${bidClass}">${bid ? formatNumber(bid[2]) : ""}</td>
+      <td class="${bidClass}">${bid ? formatNumber(bid[1]) : ""}</td>
       <td class="bid ${bidClass}">${bid ? formatPrice(bid[0]) : ""}</td>
       <td class="ask ${askClass}">${ask ? formatPrice(ask[0]) : ""}</td>
-      <td class="${askClass}">${ask ? formatNumber(ask[1].size) : ""}</td>
-      <td class="${askClass}">${ask ? formatNumber(ask[1].count) : ""}</td>
+      <td class="${askClass}">${ask ? formatNumber(ask[1]) : ""}</td>
+      <td class="${askClass}">${ask ? formatNumber(ask[2]) : ""}</td>
     `;
     el.bookBody.appendChild(tr);
   }
+}
+
+// Compact engine-computed microstructure readout for the book panel header.
+function formatBookStats(book) {
+  const parts = [`${formatNumber(book.resting)} resting orders`];
+  if (book.imbalance !== null && book.imbalance !== undefined) {
+    parts.push(`imbalance ${book.imbalance.toFixed(3)}`);
+  }
+  if (book.micro !== null && book.micro !== undefined) {
+    parts.push(`micro ${formatPrice(book.micro)}`);
+  }
+  return parts.join(" · ");
 }
 
 async function loadChartChunk({ preserveCandles = false } = {}) {
@@ -1708,6 +1718,12 @@ el.replayDate.addEventListener("change", () => setReplayDate(el.replayDate.value
 el.replayLoad.addEventListener("click", () => loadReplayChunk());
 el.replayNext.addEventListener("click", () => stepReplay(1));
 el.replayPrev.addEventListener("click", () => stepReplay(-1));
+el.replayPlay.addEventListener("click", () => {
+  if (state.replay.playing) stopReplayPlayback();
+  else startReplayPlayback();
+});
+el.replaySlower.addEventListener("click", () => adjustReplaySpeed(-1));
+el.replayFaster.addEventListener("click", () => adjustReplaySpeed(1));
 el.replayOffset.addEventListener("keydown", (event) => {
   if (event.key === "Enter") loadReplayChunk();
 });
@@ -1758,6 +1774,7 @@ setTheme(preferredTheme());
 async function initDashboard() {
   await loadReplayDates();
   await loadOrderbooks();
+  updateReplaySpeedControls();
   updateChartSpeedControls();
   updateStrategySpeedControls();
 }

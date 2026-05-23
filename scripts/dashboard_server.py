@@ -10,6 +10,7 @@ import mimetypes
 import re
 import socket
 import sys
+import threading
 from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,6 +23,7 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from engine.config import INSTRUMENTS, TZ_ET as ENGINE_TZ_ET  # noqa: E402
+from engine.orderbook import OrderBook  # noqa: E402
 from engine.replay_runner import run_from_parquet, trades_as_records  # noqa: E402
 
 
@@ -46,6 +48,9 @@ EVENT_COLUMNS = [
     "channel_id",
 ]
 REPLAY_CHUNK_LIMIT = 10_000
+# Levels per side returned in a book-replay snapshot. A real DOM ladder is
+# only a few dozen levels deep; capping keeps the per-chunk payload small.
+BOOK_REPLAY_DEPTH = 50
 DATE_PARTITION_RE = re.compile(r"(?:^|[\\/])date=(\d{4}-\d{2}-\d{2})(?:[\\/]|$)")
 
 # RTH window: 09:30 ET inclusive to 16:00 ET exclusive.
@@ -83,6 +88,10 @@ class DashboardData:
         self._schema: set[str] | None = None
         self._strategy_cache: dict[str, dict] = {}
         self._rth_ts_cache: dict[str, pl.Series] = {}
+        # Per-date reconstructed book carried across sequential chunk requests
+        # so playback continues without re-replaying. {date: {book, next_row}}.
+        self._book_cache: dict[str, dict] = {}
+        self._book_lock = threading.Lock()
 
     def _rth_event_timestamps(self, session_date: str) -> pl.Series:
         """Return ts_event values for all RTH events on the given session
@@ -250,6 +259,65 @@ class DashboardData:
             "events": frame_to_records(frame),
         }
 
+    def book_replay(
+        self,
+        offset: int = 0,
+        limit: int = 1000,
+        session_date: str | None = None,
+        cont: bool = False,
+    ) -> dict:
+        """Like replay_events, but reconstructs the order book server-side via
+        engine.orderbook.OrderBook (the single source of truth) and returns a
+        book snapshot after each event.
+
+        ``cont`` continues the book from the previously served chunk for this
+        date (used by playback crossing a chunk boundary). A fresh request
+        starts the book empty at ``offset`` — the same semantics the prior
+        client-side replay had (a manual load at row 0 reflects the session's
+        opening snapshot; a manual load mid-stream warms up from empty).
+        """
+        offset = max(0, offset)
+        limit = max(1, min(limit, REPLAY_CHUNK_LIMIT))
+        parsed_date = parse_session_date(session_date)
+        summary = self.replay_summary(parsed_date, rth_only=False)
+        total = summary["total"]
+
+        if total == 0:
+            return {"offset": offset, "limit": limit, **summary,
+                    "events": [], "books": []}
+
+        frame = (
+            self.scan(parsed_date)
+            .select([col for col in EVENT_COLUMNS if col in self.schema()])
+            .with_row_index("row", offset=0)
+            .slice(offset, limit)
+            .with_columns(
+                pl.when(pl.col("price") == UNDEF_PRICE)
+                .then(None)
+                .otherwise(pl.col("price") / PRICE_SCALE)
+                .alias("price_display")
+            )
+            .collect()
+        )
+        events = frame_to_records(frame)
+
+        key = parsed_date.isoformat() if parsed_date else "__all__"
+        with self._book_lock:
+            cached = self._book_cache.get(key)
+            if cont and cached is not None and cached["next_row"] == offset:
+                book = cached["book"]
+            else:
+                book = OrderBook()
+            books = []
+            for event in events:
+                event["effect"] = _apply_event_to_book(book, event)
+                books.append(_book_snapshot(book, BOOK_REPLAY_DEPTH))
+            self._book_cache[key] = {"book": book,
+                                     "next_row": offset + len(events)}
+
+        return {"offset": offset, "limit": limit, **summary,
+                "events": events, "books": books}
+
     def strategy_session(
         self,
         session_date: str,
@@ -361,6 +429,60 @@ def _summarize_trades(trades: list[dict]) -> dict:
     }
 
 
+def _book_side_name(side: str) -> str:
+    return {"B": "Bid", "A": "Ask"}.get(side, side)
+
+
+def _price_str(price_display) -> str:
+    return f"{price_display:,.2f}" if price_display is not None else "—"
+
+
+def _apply_event_to_book(book: OrderBook, event: dict) -> str:
+    """Apply one MBO event to the book and return a human-readable effect
+    string (mirrors the messages the old client-side replay produced)."""
+    action = event["action"]
+    side = event["side"]
+    order_id = event["order_id"]
+    size = event["size"]
+    price_display = event.get("price_display")
+
+    before = book.orders.get(order_id)
+    before_size = before.size if before else None
+    before_pdisp = (before.price / PRICE_SCALE) if before else None
+    resting_before = len(book.orders)
+
+    book.apply(action, side, int(event["price"]), int(size), order_id)
+
+    if action == "R":
+        return f"Cleared {resting_before} resting orders."
+    if action == "A":
+        return f"Added {size} @ {_price_str(price_display)} on {_book_side_name(side)}."
+    if action == "C":
+        if before is None:
+            return "Cancel referenced an order that is not in the local replay state."
+        return (f"Canceled {min(size, before_size)} from "
+                f"{_book_side_name(side)} order {order_id}.")
+    if action == "M":
+        if before is None:
+            return (f"Modified order was not present locally, inserted "
+                    f"{size} @ {_price_str(price_display)}.")
+        return (f"Modified {order_id} from {before_size} @ {_price_str(before_pdisp)} "
+                f"to {size} @ {_price_str(price_display)}.")
+    return f"{action} does not change resting order state."
+
+
+def _book_snapshot(book: OrderBook, depth: int) -> dict:
+    """Top-`depth` levels per side plus engine-computed microstructure."""
+    return {
+        "bids": [[lvl.price_display, lvl.size, lvl.count] for lvl in book.bids(depth)],
+        "asks": [[lvl.price_display, lvl.size, lvl.count] for lvl in book.asks(depth)],
+        "resting": len(book.orders),
+        "mid": book.mid(),
+        "micro": book.microprice(),
+        "imbalance": book.imbalance(),
+    }
+
+
 def parse_session_date(value: str | None) -> date | None:
     if not value:
         return None
@@ -436,6 +558,24 @@ def create_handler(data: DashboardData, static_dir: Path):
                             limit=limit,
                             session_date=session_date,
                             rth_only=rth_only,
+                        )
+                    )
+                except ValueError as exc:
+                    self.respond_json({"error": str(exc)}, status=400)
+                return
+            if parsed.path == "/api/book-replay":
+                query = parse_qs(parsed.query)
+                try:
+                    offset = int(query.get("offset", ["0"])[0])
+                    limit = int(query.get("limit", ["1000"])[0])
+                    session_date = query.get("date", [None])[0]
+                    cont = query.get("cont", ["false"])[0].lower() == "true"
+                    self.respond_json(
+                        data.book_replay(
+                            offset=offset,
+                            limit=limit,
+                            session_date=session_date,
+                            cont=cont,
                         )
                     )
                 except ValueError as exc:

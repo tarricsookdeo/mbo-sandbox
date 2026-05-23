@@ -7,4 +7,5 @@ dependencies = [
     "pyarrow==24.0.0",
     "polars==1.40.1",
     "duckdb==1.5.2",
+    "sortedcontainers>=2.4.0",
 ]
