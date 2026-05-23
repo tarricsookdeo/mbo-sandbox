@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>MBO Event Inspector</title>
     <link rel="stylesheet" href="/styles.css" />
+    <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
   </head>
   <body>
     <main class="shell">
@@ -173,7 +174,7 @@
                 <span id="strategy-summary">No data</span>
               </div>
               <div class="chart-wrap">
-                <canvas id="strategy-chart"></canvas>
+                <div id="strategy-chart"></div>
               </div>
             </article>
 
@@ -244,7 +245,7 @@
                 <span id="chart-summary">0 trades</span>
               </div>
               <div class="chart-wrap">
-                <canvas id="candle-chart"></canvas>
+                <div id="candle-chart"></div>
               </div>
             </article>
           </section>

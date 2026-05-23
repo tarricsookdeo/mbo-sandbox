@@ -69,7 +69,7 @@ const CHART_SPEEDS = [
   { label: "2x", delay: 30, batch: 1 },
   { label: "4x", delay: 12, batch: 1 },
   { label: "8x", delay: 1, batch: 1 },
-  { label: "20x", delay: 1, batch: 3 },
+  { label: "100x", delay: 1, batch: 8 },
 ];
 const DEFAULT_CHART_SPEED_INDEX = 2;
 const THEME_STORAGE_KEY = "mbo-dashboard-theme";
@@ -169,6 +169,8 @@ function setTheme(theme) {
   el.themeToggle.textContent = theme === "dark" ? "☀" : "◐";
   el.themeToggle.title = theme === "dark" ? "Use light theme" : "Use dark theme";
   el.themeToggle.setAttribute("aria-label", el.themeToggle.title);
+  applyCandleChartTheme();
+  applyStrategyChartTheme();
 }
 
 function formatNumber(value) {
@@ -730,7 +732,7 @@ async function stepChart(direction, { render = true } = {}) {
   applyChartEvent(event);
   if (render) {
     renderChartEvent(event);
-    drawCandles();
+    syncLastCandle();
   }
   return event;
 }
@@ -917,129 +919,90 @@ function themeColor(name) {
   return getComputedStyle(document.body).getPropertyValue(name).trim();
 }
 
-function formatAxisTime(timestamp) {
-  return new Intl.DateTimeFormat(undefined, {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  }).format(new Date(timestamp));
+
+let candleChartInstance = null;
+let candleChartSeries = null;
+
+function ensureCandleChart() {
+  if (candleChartInstance) return true;
+  const container = el.candleChart;
+  if (!container || container.clientWidth === 0 || container.clientHeight === 0) {
+    return false;
+  }
+  candleChartInstance = LightweightCharts.createChart(container, candleChartLayoutOptions());
+  candleChartSeries = candleChartInstance.addCandlestickSeries(candleSeriesOptions());
+  return true;
+}
+
+function candleChartLayoutOptions() {
+  return {
+    autoSize: true,
+    layout: {
+      background: { color: themeColor("--surface") },
+      textColor: themeColor("--text"),
+    },
+    grid: {
+      vertLines: { color: themeColor("--line") },
+      horzLines: { color: themeColor("--line") },
+    },
+    rightPriceScale: { borderColor: themeColor("--line") },
+    timeScale: {
+      borderColor: themeColor("--line"),
+      timeVisible: true,
+      secondsVisible: true,
+    },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  };
+}
+
+function candleSeriesOptions() {
+  const up = themeColor("--bid");
+  const down = themeColor("--ask");
+  return {
+    upColor: up,
+    downColor: down,
+    borderUpColor: up,
+    borderDownColor: down,
+    wickUpColor: up,
+    wickDownColor: down,
+  };
+}
+
+function applyCandleChartTheme() {
+  if (!candleChartInstance) return;
+  candleChartInstance.applyOptions(candleChartLayoutOptions());
+  candleChartSeries.applyOptions(candleSeriesOptions());
+}
+
+function toLwTime(ms) {
+  const offsetMs = new Date(ms).getTimezoneOffset() * 60_000;
+  return Math.floor((ms - offsetMs) / 1000);
+}
+
+function toLightweightCandle(c) {
+  return {
+    time: toLwTime(c.start),
+    open: c.open,
+    high: c.high,
+    low: c.low,
+    close: c.close,
+  };
+}
+
+function withAlphaHex(color, alphaHex) {
+  return color.length === 7 && color.startsWith("#") ? `${color}${alphaHex}` : color;
 }
 
 function drawCandles() {
-  const canvas = el.candleChart;
-  const rect = canvas.getBoundingClientRect();
-  if (!rect.width || !rect.height) return;
+  if (!ensureCandleChart()) return;
+  candleChartSeries.setData(state.chart.candles.map(toLightweightCandle));
+  renderChartSummary();
+}
 
-  const ratio = window.devicePixelRatio || 1;
-  canvas.width = Math.floor(rect.width * ratio);
-  canvas.height = Math.floor(rect.height * ratio);
-
-  const ctx = canvas.getContext("2d");
-  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-
-  const width = rect.width;
-  const height = rect.height;
-  const surface = themeColor("--surface");
-  const text = themeColor("--text");
-  const muted = themeColor("--muted");
-  const line = themeColor("--line");
-  const bid = themeColor("--bid");
-  const ask = themeColor("--ask");
-
-  ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = surface;
-  ctx.fillRect(0, 0, width, height);
-
-  const plot = {
-    left: 14,
-    right: width - 76,
-    top: 18,
-    bottom: height - 34,
-  };
-  const plotWidth = Math.max(1, plot.right - plot.left);
-  const plotHeight = Math.max(1, plot.bottom - plot.top);
-  const visible = state.chart.candles.slice(-CHART_VISIBLE_CANDLES);
-
-  ctx.font = "12px Inter, ui-sans-serif, system-ui, sans-serif";
-  ctx.textBaseline = "middle";
-
-  if (!visible.length) {
-    ctx.fillStyle = muted;
-    ctx.textAlign = "center";
-    ctx.fillText("No trades yet", width / 2, height / 2);
-    renderChartSummary();
-    return;
-  }
-
-  let minPrice = Math.min(...visible.map((candle) => candle.low));
-  let maxPrice = Math.max(...visible.map((candle) => candle.high));
-  if (minPrice === maxPrice) {
-    minPrice -= 1;
-    maxPrice += 1;
-  } else {
-    const padding = (maxPrice - minPrice) * 0.08;
-    minPrice -= padding;
-    maxPrice += padding;
-  }
-
-  const priceToY = (price) => {
-    return plot.top + ((maxPrice - price) / (maxPrice - minPrice)) * plotHeight;
-  };
-
-  ctx.strokeStyle = line;
-  ctx.fillStyle = muted;
-  ctx.textAlign = "left";
-  for (let index = 0; index <= 4; index += 1) {
-    const y = plot.top + (plotHeight / 4) * index;
-    const price = maxPrice - ((maxPrice - minPrice) / 4) * index;
-    ctx.beginPath();
-    ctx.moveTo(plot.left, y);
-    ctx.lineTo(plot.right, y);
-    ctx.stroke();
-    ctx.fillText(formatPrice(price), plot.right + 8, y);
-  }
-
-  const spacing = plotWidth / visible.length;
-  const bodyWidth = Math.max(3, Math.min(12, spacing * 0.58));
-  visible.forEach((candle, index) => {
-    const x = plot.left + spacing * index + spacing / 2;
-    const yOpen = priceToY(candle.open);
-    const yClose = priceToY(candle.close);
-    const yHigh = priceToY(candle.high);
-    const yLow = priceToY(candle.low);
-    const up = candle.close >= candle.open;
-    const color = up ? bid : ask;
-
-    ctx.strokeStyle = color;
-    ctx.fillStyle = color;
-    ctx.beginPath();
-    ctx.moveTo(x, yHigh);
-    ctx.lineTo(x, yLow);
-    ctx.stroke();
-
-    const bodyTop = Math.min(yOpen, yClose);
-    const bodyHeight = Math.max(2, Math.abs(yClose - yOpen));
-    ctx.fillRect(x - bodyWidth / 2, bodyTop, bodyWidth, bodyHeight);
-  });
-
-  const last = visible[visible.length - 1];
-  const lastY = priceToY(last.close);
-  ctx.strokeStyle = text;
-  ctx.setLineDash([4, 4]);
-  ctx.beginPath();
-  ctx.moveTo(plot.left, lastY);
-  ctx.lineTo(plot.right, lastY);
-  ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.fillStyle = text;
-  ctx.fillText(formatPrice(last.close), plot.right + 8, lastY);
-
-  ctx.fillStyle = muted;
-  ctx.textBaseline = "alphabetic";
-  ctx.textAlign = "left";
-  ctx.fillText(formatAxisTime(visible[0].start), plot.left, height - 12);
-  ctx.textAlign = "right";
-  ctx.fillText(formatAxisTime(last.start), plot.right, height - 12);
+function syncLastCandle() {
+  if (!ensureCandleChart()) return;
+  const last = state.chart.candles[state.chart.candles.length - 1];
+  if (last) candleChartSeries.update(toLightweightCandle(last));
   renderChartSummary();
 }
 
@@ -1305,7 +1268,11 @@ async function seekStrategy(targetOffset) {
 async function advanceStrategyToNextBar({ render = true } = {}) {
   const bars = state.strategy.session?.bars || [];
   const nextBarIdx = closedBarCountAtCurrent();
-  if (nextBarIdx >= bars.length) return null;
+  if (nextBarIdx >= bars.length) {
+    const advanced = await advanceToNextStrategyDate();
+    if (!advanced) return null;
+    return advanceStrategyToNextBar({ render });
+  }
   const target = bars[nextBarIdx];
   if (target.event_offset == null) {
     const startBars = nextBarIdx;
@@ -1337,16 +1304,24 @@ async function stepStrategyToNextBar() {
   }
 }
 
+function findNextStrategySignal() {
+  const timeline = state.strategy.session?.timeline || [];
+  const currentOffset = currentAbsoluteOffset();
+  return timeline.find(
+    (e) => e.event_offset != null && e.event_offset > currentOffset
+  );
+}
+
 async function stepStrategyToNextSignal() {
   stopStrategyPlayback();
   setStrategyButtonsDisabled(true);
   try {
-    const timeline = state.strategy.session?.timeline || [];
-    const currentOffset = currentAbsoluteOffset();
-    const next = timeline.find(
-      (e) => e.event_offset != null && e.event_offset > currentOffset
-    );
-    if (!next) return;   // no more strategy events for this session
+    let next = findNextStrategySignal();
+    while (!next) {
+      const advanced = await advanceToNextStrategyDate();
+      if (!advanced) return;
+      next = findNextStrategySignal();
+    }
     await seekStrategy(next.event_offset);
   } finally {
     setStrategyButtonsDisabled(false);
@@ -1568,165 +1543,92 @@ function updateStrategySpeedControls() {
   el.strategyFaster.disabled = state.strategy.speedIndex === CHART_SPEEDS.length - 1 || (state.strategy.chunkLoading && !state.strategy.playing);
 }
 
+let strategyChartInstance = null;
+let strategyCandleSeries = null;
+let strategyBuffSeries = null;
+const strategyPriceLines = { entry: null, stop: null, target: null };
+
+function ensureStrategyChart() {
+  if (strategyChartInstance) return true;
+  const container = el.strategyChart;
+  if (!container || container.clientWidth === 0 || container.clientHeight === 0) return false;
+  strategyChartInstance = LightweightCharts.createChart(container, candleChartLayoutOptions());
+  strategyCandleSeries = strategyChartInstance.addCandlestickSeries(candleSeriesOptions());
+  strategyBuffSeries = strategyChartInstance.addLineSeries({
+    color: themeColor("--accent-2"),
+    lineWidth: 2,
+    priceLineVisible: false,
+    lastValueVisible: false,
+  });
+  return true;
+}
+
+function applyStrategyChartTheme() {
+  if (!strategyChartInstance) return;
+  strategyChartInstance.applyOptions(candleChartLayoutOptions());
+  strategyCandleSeries.applyOptions(candleSeriesOptions());
+  strategyBuffSeries.applyOptions({ color: themeColor("--accent-2") });
+  updateStrategyPositionLines();
+}
+
+function updateStrategyPositionLines() {
+  if (!strategyCandleSeries) return;
+  for (const key of Object.keys(strategyPriceLines)) {
+    if (strategyPriceLines[key]) {
+      strategyCandleSeries.removePriceLine(strategyPriceLines[key]);
+      strategyPriceLines[key] = null;
+    }
+  }
+  const pos = state.strategy.position;
+  if (!pos) return;
+  const dashed = LightweightCharts.LineStyle.Dashed;
+  strategyPriceLines.entry = strategyCandleSeries.createPriceLine({
+    price: pos.entry, color: themeColor("--text"), lineStyle: dashed,
+    axisLabelVisible: true, title: "entry",
+  });
+  strategyPriceLines.target = strategyCandleSeries.createPriceLine({
+    price: pos.target, color: themeColor("--bid"), lineStyle: dashed,
+    axisLabelVisible: true, title: "target",
+  });
+  strategyPriceLines.stop = strategyCandleSeries.createPriceLine({
+    price: pos.stop, color: themeColor("--ask"), lineStyle: dashed,
+    axisLabelVisible: true, title: "stop",
+  });
+}
+
 function drawStrategyChart() {
-  const canvas = el.strategyChart;
-  if (!canvas) return;
-  const rect = canvas.getBoundingClientRect();
-  if (!rect.width || !rect.height) return;
-
-  const ratio = window.devicePixelRatio || 1;
-  canvas.width = Math.floor(rect.width * ratio);
-  canvas.height = Math.floor(rect.height * ratio);
-  const ctx = canvas.getContext("2d");
-  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-
-  const width = rect.width;
-  const height = rect.height;
-  const surface = themeColor("--surface");
-  const text = themeColor("--text");
-  const muted = themeColor("--muted");
-  const line = themeColor("--line");
-  const bid = themeColor("--bid");
-  const ask = themeColor("--ask");
-  const accent = themeColor("--accent-2");
-
-  ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = surface;
-  ctx.fillRect(0, 0, width, height);
-
-  const plot = { left: 14, right: width - 76, top: 18, bottom: height - 34 };
-  const plotWidth = Math.max(1, plot.right - plot.left);
-  const plotHeight = Math.max(1, plot.bottom - plot.top);
+  if (!ensureStrategyChart()) return;
 
   const bars = state.strategy.session?.bars || [];
   const closed = closedBarCountAtCurrent();
   const closedBars = bars.slice(0, closed);
   const building = state.strategy.buildingBar;
-  const combined = building ? closedBars.concat([building]) : closedBars;
-  const visible = combined.slice(-CHART_VISIBLE_CANDLES);
 
-  ctx.font = "12px Inter, ui-sans-serif, system-ui, sans-serif";
-  ctx.textBaseline = "middle";
-
-  if (!visible.length) {
-    ctx.fillStyle = muted;
-    ctx.textAlign = "center";
-    ctx.fillText(state.strategy.session ? "No bars yet — step forward" : "Load a session", width / 2, height / 2);
-    return;
+  const candleData = closedBars.map((b) => ({
+    time: toLwTime(new Date(b.bar_start).getTime()),
+    open: b.open, high: b.high, low: b.low, close: b.close,
+  }));
+  if (building) {
+    const baseColor = themeColor(building.close >= building.open ? "--bid" : "--ask");
+    const translucent = withAlphaHex(baseColor, "8c");
+    candleData.push({
+      time: toLwTime(new Date(building.start).getTime()),
+      open: building.open, high: building.high,
+      low: building.low, close: building.close,
+      color: translucent, borderColor: translucent, wickColor: translucent,
+    });
   }
+  strategyCandleSeries.setData(candleData);
 
-  const pos = state.strategy.position;
-  let minPrice = Infinity, maxPrice = -Infinity;
-  for (const bar of visible) {
-    if (bar.low < minPrice) minPrice = bar.low;
-    if (bar.high > maxPrice) maxPrice = bar.high;
-    if (bar.buff != null) {
-      if (bar.buff < minPrice) minPrice = bar.buff;
-      if (bar.buff > maxPrice) maxPrice = bar.buff;
-    }
-  }
-  if (pos) {
-    minPrice = Math.min(minPrice, pos.stop, pos.target);
-    maxPrice = Math.max(maxPrice, pos.stop, pos.target);
-  }
-  if (minPrice === maxPrice) { minPrice -= 1; maxPrice += 1; }
-  const padding = (maxPrice - minPrice) * 0.08;
-  minPrice -= padding;
-  maxPrice += padding;
+  const buffData = closedBars
+    .filter((b) => b.buff != null)
+    .map((b) => ({
+      time: toLwTime(new Date(b.bar_start).getTime()),
+      value: b.buff,
+    }));
+  strategyBuffSeries.setData(buffData);
 
-  const priceToY = (price) => plot.top + ((maxPrice - price) / (maxPrice - minPrice)) * plotHeight;
-
-  // gridlines + price axis labels
-  ctx.strokeStyle = line;
-  ctx.fillStyle = muted;
-  ctx.textAlign = "left";
-  for (let index = 0; index <= 4; index += 1) {
-    const y = plot.top + (plotHeight / 4) * index;
-    const price = maxPrice - ((maxPrice - minPrice) / 4) * index;
-    ctx.beginPath();
-    ctx.moveTo(plot.left, y);
-    ctx.lineTo(plot.right, y);
-    ctx.stroke();
-    ctx.fillText(formatPrice(price), plot.right + 8, y);
-  }
-
-  const spacing = plotWidth / visible.length;
-  const bodyWidth = Math.max(3, Math.min(12, spacing * 0.58));
-
-  // candles
-  visible.forEach((bar, index) => {
-    const x = plot.left + spacing * index + spacing / 2;
-    const yOpen = priceToY(bar.open);
-    const yClose = priceToY(bar.close);
-    const yHigh = priceToY(bar.high);
-    const yLow = priceToY(bar.low);
-    const up = bar.close >= bar.open;
-    const color = up ? bid : ask;
-    ctx.strokeStyle = color;
-    ctx.fillStyle = color;
-    if (bar.inProgress) ctx.globalAlpha = 0.55;
-    ctx.beginPath();
-    ctx.moveTo(x, yHigh); ctx.lineTo(x, yLow); ctx.stroke();
-    const bodyTop = Math.min(yOpen, yClose);
-    const bodyHeight = Math.max(2, Math.abs(yClose - yOpen));
-    ctx.fillRect(x - bodyWidth / 2, bodyTop, bodyWidth, bodyHeight);
-    ctx.globalAlpha = 1;
-  });
-
-  // buff line overlay
-  ctx.strokeStyle = accent;
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  let started = false;
-  visible.forEach((bar, index) => {
-    if (bar.buff == null) return;
-    const x = plot.left + spacing * index + spacing / 2;
-    const y = priceToY(bar.buff);
-    if (!started) { ctx.moveTo(x, y); started = true; }
-    else ctx.lineTo(x, y);
-  });
-  if (started) ctx.stroke();
-  ctx.lineWidth = 1;
-
-  // position lines (entry / stop / target)
-  if (pos) {
-    const drawLevel = (price, color, label) => {
-      const y = priceToY(price);
-      ctx.strokeStyle = color;
-      ctx.setLineDash([6, 4]);
-      ctx.beginPath();
-      ctx.moveTo(plot.left, y); ctx.lineTo(plot.right, y); ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.fillStyle = color;
-      ctx.textAlign = "left";
-      ctx.fillText(label, plot.left + 4, y - 8);
-    };
-    drawLevel(pos.entry, text, `entry ${formatPrice(pos.entry)}`);
-    drawLevel(pos.target, bid, `target ${formatPrice(pos.target)}`);
-    drawLevel(pos.stop, ask, `stop ${formatPrice(pos.stop)}`);
-  }
-
-  // last close marker
-  const last = visible[visible.length - 1];
-  const lastY = priceToY(last.close);
-  ctx.strokeStyle = text;
-  ctx.setLineDash([4, 4]);
-  ctx.beginPath();
-  ctx.moveTo(plot.left, lastY); ctx.lineTo(plot.right, lastY); ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.fillStyle = text;
-  ctx.textAlign = "left";
-  ctx.fillText(formatPrice(last.close), plot.right + 8, lastY);
-
-  // axis time labels
-  ctx.fillStyle = muted;
-  ctx.textBaseline = "alphabetic";
-  ctx.textAlign = "left";
-  ctx.fillText(formatTime(visible[0].bar_start).slice(11, 16), plot.left, height - 12);
-  ctx.textAlign = "right";
-  ctx.fillText(formatTime(last.bar_start).slice(11, 16), plot.right, height - 12);
-
-  renderStrategySummary();
+  updateStrategyPositionLines();
 }
 
 el.filter.addEventListener("input", renderOrderbooks);
@@ -1788,11 +1690,6 @@ el.strategyPlay.addEventListener("click", () => {
 });
 el.strategySlower.addEventListener("click", () => adjustStrategySpeed(-1));
 el.strategyFaster.addEventListener("click", () => adjustStrategySpeed(1));
-
-window.addEventListener("resize", () => {
-  drawCandles();
-  drawStrategyChart();
-});
 
 setTheme(preferredTheme());
 async function initDashboard() {
