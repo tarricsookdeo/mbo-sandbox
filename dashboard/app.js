@@ -1037,12 +1037,29 @@ function resetStrategyState() {
   state.strategy.offset = 0;
   state.strategy.index = -1;
   state.strategy.lastEvent = null;
+  state.strategy.lastEventMs = null;
   state.strategy.lastTradePrice = null;
   state.strategy.timelineIndex = 0;
   state.strategy.appliedEvents = [];
   state.strategy.position = null;
   state.strategy.realizedPnl = 0;
   state.strategy.buildingBar = null;
+}
+
+function enrichStrategySession(payload) {
+  if (!payload) return payload;
+  if (Array.isArray(payload.bars)) {
+    for (const bar of payload.bars) {
+      bar._startMs = new Date(bar.bar_start).getTime();
+      bar._endMs = new Date(bar.bar_end).getTime();
+    }
+  }
+  if (Array.isArray(payload.timeline)) {
+    for (const ev of payload.timeline) {
+      ev._tsMs = new Date(ev.ts).getTime();
+    }
+  }
+  return payload;
 }
 
 async function loadStrategySession() {
@@ -1054,7 +1071,7 @@ async function loadStrategySession() {
   try {
     const params = new URLSearchParams({ date: state.strategy.date });
     const payload = await fetchJson(`/api/strategy-session?${params}`);
-    state.strategy.session = payload;
+    state.strategy.session = enrichStrategySession(payload);
     resetTimelineApplication();
     await loadStrategyChunk();
     renderStrategySession();
@@ -1098,6 +1115,7 @@ async function loadStrategyChunk({ preserveProgress = false } = {}) {
     if (!preserveProgress) {
       state.strategy.index = -1;
       state.strategy.lastEvent = null;
+      state.strategy.lastEventMs = null;
     }
   } finally {
     state.strategy.chunkLoading = false;
@@ -1116,12 +1134,13 @@ async function advanceToNextStrategyDate() {
     el.strategyDate.value = nextDate;
     const params = new URLSearchParams({ date: nextDate });
     const payload = await fetchJson(`/api/strategy-session?${params}`);
-    state.strategy.session = payload;
+    state.strategy.session = enrichStrategySession(payload);
     resetTimelineApplication();
     state.strategy.offset = 0;
     state.strategy.index = -1;
     state.strategy.events = [];
     state.strategy.lastEvent = null;
+    state.strategy.lastEventMs = null;
     await loadStrategyChunk();
     renderStrategySession();
     return true;
@@ -1158,6 +1177,7 @@ async function stepStrategy(direction, { render = true } = {}) {
   state.strategy.index = nextIndex;
   const event = state.strategy.events[state.strategy.index];
   state.strategy.lastEvent = event;
+  state.strategy.lastEventMs = new Date(event.ts_event).getTime();
   applyStrategyEvent(event);
 
   if (render) {
@@ -1175,11 +1195,10 @@ function applyStrategyEvent(event) {
   }
   updateStrategyBuildingBar(event);
   const timeline = state.strategy.session?.timeline || [];
-  const eventTime = new Date(event.ts_event).getTime();
+  const eventTime = state.strategy.lastEventMs;
   while (state.strategy.timelineIndex < timeline.length) {
     const next = timeline[state.strategy.timelineIndex];
-    const nextTime = new Date(next.ts).getTime();
-    if (nextTime > eventTime) break;
+    if (next._tsMs > eventTime) break;
     applyTimelineEvent(next);
     state.strategy.timelineIndex += 1;
   }
@@ -1196,16 +1215,16 @@ function updateStrategyBuildingBar(event) {
   }
   const price = Number(event.price_display);
   if (!Number.isFinite(price)) return;
-  const eventMs = new Date(event.ts_event).getTime();
-  const startMs = new Date(openBar.bar_start).getTime();
-  const endMs = new Date(openBar.bar_end).getTime();
-  if (eventMs < startMs || eventMs >= endMs) return;
+  const eventMs = state.strategy.lastEventMs;
+  if (eventMs < openBar._startMs || eventMs >= openBar._endMs) return;
   const size = Number(event.size || 0);
   let building = state.strategy.buildingBar;
   if (!building || building.start !== openBar.bar_start) {
     building = {
       start: openBar.bar_start,
       end: openBar.bar_end,
+      _startMs: openBar._startMs,
+      _endMs: openBar._endMs,
       open: price,
       high: price,
       low: price,
@@ -1333,13 +1352,12 @@ async function stepStrategyToNextSignal() {
 }
 
 function closedBarCountAtCurrent() {
-  const event = state.strategy.lastEvent;
   const bars = state.strategy.session?.bars || [];
-  if (!event || !bars.length) return 0;
-  const cutoff = new Date(event.ts_event).getTime();
+  const cutoff = state.strategy.lastEventMs;
+  if (!cutoff || !bars.length) return 0;
   let count = 0;
   for (const bar of bars) {
-    if (new Date(bar.bar_end).getTime() <= cutoff) count += 1;
+    if (bar._endMs <= cutoff) count += 1;
     else break;
   }
   return count;
@@ -1547,6 +1565,10 @@ let strategyChartInstance = null;
 let strategyCandleSeries = null;
 let strategyBuffSeries = null;
 const strategyPriceLines = { entry: null, stop: null, target: null };
+let strategyChartSyncedSession = null;
+let strategyChartSyncedClosedCount = 0;
+let strategyChartSyncedBuildingStart = null;
+let strategyChartSyncedPosKey = null;
 
 function ensureStrategyChart() {
   if (strategyChartInstance) return true;
@@ -1596,39 +1618,80 @@ function updateStrategyPositionLines() {
   });
 }
 
-function drawStrategyChart() {
-  if (!ensureStrategyChart()) return;
-
-  const bars = state.strategy.session?.bars || [];
-  const closed = closedBarCountAtCurrent();
-  const closedBars = bars.slice(0, closed);
-  const building = state.strategy.buildingBar;
-
-  const candleData = closedBars.map((b) => ({
-    time: toLwTime(new Date(b.bar_start).getTime()),
+function barToCandleData(b) {
+  return {
+    time: toLwTime(b._startMs),
     open: b.open, high: b.high, low: b.low, close: b.close,
-  }));
-  if (building) {
-    const baseColor = themeColor(building.close >= building.open ? "--bid" : "--ask");
-    const translucent = withAlphaHex(baseColor, "8c");
-    candleData.push({
-      time: toLwTime(new Date(building.start).getTime()),
-      open: building.open, high: building.high,
-      low: building.low, close: building.close,
-      color: translucent, borderColor: translucent, wickColor: translucent,
-    });
-  }
-  strategyCandleSeries.setData(candleData);
+  };
+}
 
+function barToBuffPoint(b) {
+  return { time: toLwTime(b._startMs), value: b.buff };
+}
+
+function buildingToCandleData(building) {
+  const baseColor = themeColor(building.close >= building.open ? "--bid" : "--ask");
+  const translucent = withAlphaHex(baseColor, "8c");
+  return {
+    time: toLwTime(building._startMs),
+    open: building.open, high: building.high,
+    low: building.low, close: building.close,
+    color: translucent, borderColor: translucent, wickColor: translucent,
+  };
+}
+
+function positionKey(pos) {
+  return pos ? `${pos.side}|${pos.entry}|${pos.stop}|${pos.target}|${pos.qty}` : null;
+}
+
+function rebuildStrategyChart(bars, closed, building) {
+  const closedBars = bars.slice(0, closed);
+  const candleData = closedBars.map(barToCandleData);
+  if (building) candleData.push(buildingToCandleData(building));
+  strategyCandleSeries.setData(candleData);
   const buffData = closedBars
     .filter((b) => b.buff != null)
-    .map((b) => ({
-      time: toLwTime(new Date(b.bar_start).getTime()),
-      value: b.buff,
-    }));
+    .map(barToBuffPoint);
   strategyBuffSeries.setData(buffData);
-
+  strategyChartSyncedSession = state.strategy.session;
+  strategyChartSyncedClosedCount = closed;
+  strategyChartSyncedBuildingStart = building?.start || null;
   updateStrategyPositionLines();
+  strategyChartSyncedPosKey = positionKey(state.strategy.position);
+}
+
+function drawStrategyChart() {
+  if (!ensureStrategyChart()) return;
+  const session = state.strategy.session;
+  const bars = session?.bars || [];
+  const closed = closedBarCountAtCurrent();
+  const building = state.strategy.buildingBar;
+
+  if (session !== strategyChartSyncedSession) {
+    rebuildStrategyChart(bars, closed, building);
+    return;
+  }
+  if (!building && strategyChartSyncedBuildingStart) {
+    rebuildStrategyChart(bars, closed, building);
+    return;
+  }
+
+  for (let i = strategyChartSyncedClosedCount; i < closed; i += 1) {
+    strategyCandleSeries.update(barToCandleData(bars[i]));
+    if (bars[i].buff != null) strategyBuffSeries.update(barToBuffPoint(bars[i]));
+  }
+  strategyChartSyncedClosedCount = closed;
+
+  if (building) {
+    strategyCandleSeries.update(buildingToCandleData(building));
+    strategyChartSyncedBuildingStart = building.start;
+  }
+
+  const posKey = positionKey(state.strategy.position);
+  if (posKey !== strategyChartSyncedPosKey) {
+    updateStrategyPositionLines();
+    strategyChartSyncedPosKey = posKey;
+  }
 }
 
 el.filter.addEventListener("input", renderOrderbooks);
